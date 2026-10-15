@@ -2,48 +2,83 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import axios from "axios";
+import http from "http";
 
+// === Render Web Service Port Binding ===
+const PORT = process.env.PORT || 10000;
+
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Xiaozhi Weather MCP Server is Live!");
+}).listen(PORT, () => {
+  console.log(`HTTP Health check server running on port ${PORT}`);
+});
+
+// === MCP Server Setup ===
 const server = new Server(
   { name: "xiaozhi-weather-mcp", version: "1.0.0" }, 
   { capabilities: { tools: {} } }
 );
 
-// ওপেন-ওয়েদার ম্যাপ এপিআই এর মূল ইউআরএল
-const API_BASE_URL = "https://openweathermap.org";
-
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [{
-    name: "get_weather_update",
-    description: "যেকোনো শহরের নাম দিয়ে বর্তমান লাইভ আবহাওয়ার আপডেট ও তাপমাত্রা জানার টুল।",
-    inputSchema: {
-      type: "object",
-      properties: {
-        city: { type: "string", description: "শহরের নাম (যেমন: Dhaka, Narsingdi)" }
-      },
-      required: ["city"]
+  tools: [
+    {
+      name: "get_weather",
+      description: "নির্দিষ্ট শহর বা এলাকার (ডিফল্ট ঢাকা/নরসিংদী) লাইভ তাপমাত্রা, আবহাওয়া ও বিস্তারিত তথ্য পাওয়ার টুল।",
+      inputSchema: {
+        type: "object",
+        properties: {
+          city: { type: "string", description: "সিটির নাম (যেমন: Dhaka, Narsingdi, Sylhet, Chittagong)" }
+        }
+      }
     }
-  }]
+  ]
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name === "get_weather_update") {
-    // কোয়েব এর এনভায়রনমেন্ট ভেরিয়েবল থেকে সিক্রেট এপিআই কি-টি রিড করবে
-    const apiKey = process.env.WEATHER_API_KEY;
-    const city = request.params.arguments.city || "Dhaka";
+  const { name, arguments: args } = request.params;
 
-    if (!apiKey) {
-      return { content: [{ type: "text", text: "দুঃখিত, ব্যাকএন্ডে WEATHER_API_KEY সেট করা নেই।" }] };
-    }
-
+  if (name === "get_weather") {
+    // ডিফল্টভাবে ঢাকা (রানা ভাইয়ের লোকেশন) সেট করা, চাইলে ইউজার সিটি বদলাতে পারবে
+    const cityName = args.city || "Dhaka";
+    
     try {
-      const response = await axios.get(`${API_BASE_URL}?q=${city}&appid=${apiKey}&units=metric&lang=bn`);
-      const data = response.data;
+      // প্রথমে শহরের জিও-কোড (Latitude & Longitude) বের করার ফ্রি এপিআই
+      const geoRes = await axios.get(`https://geocoding-api.open-meteo.com/v1/search?name=${cityName}&count=1`);
       
-      const report = `${city} শহরের বর্তমান তাপমাত্রা ${data.main.temp}°C। আকাশ বর্তমানে ${data.weather[0].description} এবং বাতাসের আর্দ্রতা ${data.main.humidity}%।`;
+      if (!geoRes.data.results || geoRes.data.results.length === 0) {
+        return { content: [{ type: "text", text: `দুঃখিত রানা ভাই, "${cityName}" নামে কোনো স্থান খুঁজে পাওয়া যায়নি।` }] };
+      }
+
+      const location = geoRes.data.results[0];
+      const { latitude, longitude, name: resolvedCity, country } = location;
+
+      // এবার সেই লোকেশনের লাইভ আবহাওয়া ও বিস্তারিত ডেটা নেওয়ার ফ্রি এপিআই
+      const weatherRes = await axios.get(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m`);
       
-      return { content: [{ type: "text", text: report }] };
+      const current = weatherRes.data.current;
+      
+      // আবহাওয়া কোড ডিকোড করার সহজ লজিক
+      const getWeatherCondition = (code) => {
+        if (code === 0) return "আকাশ পরিষ্কার এবং রোদোজ্জ্বল ☀️";
+        if (code >= 1 && code <= 3) return "আংশিক মেঘলা ⛅";
+        if (code >= 51 && code <= 67) return "বষ্টিপাত হচ্ছে 🌧️";
+        if (code >= 95) return "ঝড়ো হাওয়া ও বজ্রপাত ⛈️";
+        return "স্বাভাবিক আবহাওয়া 🌤️";
+      };
+
+      const weatherReport = `📍 স্থান: ${resolvedCity}, ${country || 'Bangladesh'}
+🌡️ তাপমাত্রা: ${current.temperature_2m}°C
+👤 অনুভূত হচ্ছে: ${current.apparent_temperature}°C
+💧 আর্দ্রতা (Humidity): ${current.relative_humidity_2m}%
+💨 বাতাসের গতিবেগ: ${current.wind_speed_10m} কিমি/ঘণ্টা
+🌧️ বৃষ্টিপাত: ${current.precipitation} মিমি
+🌥️ আবহাওয়া পরিস্থিতি: ${getWeatherCondition(current.weather_code)}`;
+
+      return { content: [{ type: "text", text: `রানা ভাই, ${resolvedCity} এর বর্তমান আবহাওয়া বিস্তারিত:\n\n${weatherReport}` }] };
+      
     } catch (error) {
-      return { content: [{ type: "text", text: `দুঃখিত, ${city} শহরের আবহাওয়া তথ্য এই মুহূর্তে খুঁজে পাওয়া যায়নি।` }] };
+      return { content: [{ type: "text", text: "দুঃখিত রানা ভাই, আবহাওয়া সার্ভার থেকে ডেটা আনতে সাময়িক সমস্যা হয়েছে।" }] };
     }
   }
 });
